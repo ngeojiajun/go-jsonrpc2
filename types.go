@@ -6,7 +6,7 @@ import (
 	"errors"
 )
 
-// File: internal/jsonrpc/types.go
+// File: types.go
 // Provide some typedefs
 
 type Blob []byte

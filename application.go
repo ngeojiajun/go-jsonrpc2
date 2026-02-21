@@ -17,7 +17,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// File: internal/jsonrpc/application.go
+// File: application.go
 // Provide simple handling for jsonrpc
 
 // Base type for RPC Method
@@ -41,7 +41,7 @@ type JSONRPCApplicationOptions = func(f *JSONRPCApplication)
 func NewJSONRPCApplication(opts ...JSONRPCApplicationOptions) *JSONRPCApplication {
 	app := &JSONRPCApplication{
 		methods: make(map[string]RPCMethod),
-		tracer:  otel.Tracer("internal/jsonrpc/application"),
+		tracer:  otel.Tracer("github.com/ngeojiajun/go-jsonrpc2/application"),
 		logger:  slog.New(slog.DiscardHandler), // default to discard, can be overridden by options
 	}
 	for _, opt := range opts {
