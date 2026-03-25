@@ -131,7 +131,7 @@ func TestClient_Options(t *testing.T) {
 	server := createServer(app)
 	defer server.Close()
 
-	client := jsonrpc.NewClient(server.URL + "/rpc", jsonrpc.WithHeader("X-Custom-Header", "hello"))
+	client := jsonrpc.NewClient(server.URL+"/rpc", jsonrpc.WithHeader("X-Custom-Header", "hello"))
 	ctx := context.Background()
 
 	res, err := jsonrpc.Call[struct{}, string](ctx, client, "check_header", struct{}{})
