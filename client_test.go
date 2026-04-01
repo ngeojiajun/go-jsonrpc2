@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	jsonrpc "github.com/ngeojiajun/go-jsonrpc2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,14 +21,12 @@ import (
 )
 
 func createServer(app *jsonrpc.JSONRPCApplication) *httptest.Server {
-	r := gin.New()
-	r.POST("/rpc", app.Handle)
-	return httptest.NewServer(r)
+	return httptest.NewServer(app)
 }
 
 func TestClient_Call(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		return p.A + p.B, nil
 	})
 
@@ -44,10 +41,24 @@ func TestClient_Call(t *testing.T) {
 	assert.Equal(t, 30, res)
 }
 
+func TestLocalClient_Call(t *testing.T) {
+	app := jsonrpc.NewJSONRPCApplication()
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
+		return p.A + p.B, nil
+	})
+
+	client := jsonrpc.NewLocalClient(app)
+	ctx := context.Background()
+
+	res, err := jsonrpc.Call[SumParams, int](ctx, client, "sum", SumParams{A: 3, B: 9})
+	assert.NoError(t, err)
+	assert.Equal(t, 12, res)
+}
+
 func TestClient_Notify(t *testing.T) {
 	var notified atomic.Int32
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "notify", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "notify", func(ctx context.Context, p SumParams) (int, error) {
 		notified.Add(1)
 		return 0, nil
 	})
@@ -63,12 +74,28 @@ func TestClient_Notify(t *testing.T) {
 	assert.Eventually(t, func() bool { return notified.Load() == 1 }, 1*time.Second, 10*time.Millisecond)
 }
 
+func TestLocalClient_Notify(t *testing.T) {
+	var notified atomic.Int32
+	app := jsonrpc.NewJSONRPCApplication()
+	_ = jsonrpc.AddTypedMethod(app, "notify", func(ctx context.Context, p SumParams) (int, error) {
+		notified.Add(1)
+		return 0, nil
+	})
+
+	client := jsonrpc.NewLocalClient(app)
+	ctx := context.Background()
+
+	err := jsonrpc.Notify(ctx, client, "notify", SumParams{A: 10, B: 20})
+	assert.NoError(t, err)
+	assert.Equal(t, int32(1), notified.Load())
+}
+
 func TestClient_Batch(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		return p.A + p.B, nil
 	})
-	_ = jsonrpc.AddTypedMethod(app, "concat", func(ctx *gin.Context, p []string) (string, error) {
+	_ = jsonrpc.AddTypedMethod(app, "concat", func(ctx context.Context, p []string) (string, error) {
 		res := ""
 		for _, s := range p {
 			res += s
@@ -101,9 +128,30 @@ func TestClient_Batch(t *testing.T) {
 	assert.Equal(t, "hello world", concat)
 }
 
+func TestLocalClient_Batch(t *testing.T) {
+	app := jsonrpc.NewJSONRPCApplication()
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
+		return p.A + p.B, nil
+	})
+
+	client := jsonrpc.NewLocalClient(app)
+	ctx := context.Background()
+
+	batch := client.NewBatch()
+	sumCall, err := jsonrpc.AddBatchCall[SumParams, int](batch, "sum", SumParams{A: 5, B: 6})
+	require.NoError(t, err)
+
+	err = batch.Execute(ctx)
+	assert.NoError(t, err)
+
+	sum, err := sumCall.Wait()
+	assert.NoError(t, err)
+	assert.Equal(t, 11, sum)
+}
+
 func TestClient_Error(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "fail", func(ctx *gin.Context, p struct{}) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "fail", func(ctx context.Context, p struct{}) (int, error) {
 		return 0, fmt.Errorf("intentional failure")
 	})
 
@@ -122,20 +170,74 @@ func TestClient_Error(t *testing.T) {
 }
 
 func TestClient_Options(t *testing.T) {
+	var capturedHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedHeader = r.Header.Get("X-Custom-Header")
+		result := json.RawMessage(`"ok"`)
+		body, err := json.Marshal(jsonrpc.Response{
+			ID:     &jsonrpc.ID{Num: 1},
+			Result: &result,
+		})
+		require.NoError(t, err)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	client := jsonrpc.NewClient(server.URL, jsonrpc.WithHeader("X-Custom-Header", "hello"))
+	ctx := context.Background()
+
+	res, err := jsonrpc.Call[struct{}, string](ctx, client, "check_header", struct{}{})
+	assert.NoError(t, err)
+	assert.Equal(t, "ok", res)
+	assert.Equal(t, "hello", capturedHeader)
+}
+
+func TestClient_RequestContext(t *testing.T) {
+	type requestMeta struct {
+		UserID int `json:"user_id"`
+	}
+
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "check_header", func(ctx *gin.Context, p struct{}) (string, error) {
-		return ctx.GetHeader("X-Custom-Header"), nil
+	_ = jsonrpc.AddTypedMethod(app, "whoami", func(ctx context.Context, p struct{}) (int, error) {
+		var meta requestMeta
+		if err := jsonrpc.UnmarshalRequestContext(ctx, &meta); err != nil {
+			return 0, err
+		}
+		return meta.UserID, nil
 	})
 
 	server := createServer(app)
 	defer server.Close()
 
-	client := jsonrpc.NewClient(server.URL+"/rpc", jsonrpc.WithHeader("X-Custom-Header", "hello"))
+	client := jsonrpc.NewClient(server.URL)
 	ctx := context.Background()
 
-	res, err := jsonrpc.Call[struct{}, string](ctx, client, "check_header", struct{}{})
+	res, err := jsonrpc.Call[struct{}, int](ctx, client, "whoami", struct{}{}, jsonrpc.WithRequestContextValue(requestMeta{UserID: 42}))
 	assert.NoError(t, err)
-	assert.Equal(t, "hello", res)
+	assert.Equal(t, 42, res)
+}
+
+func TestLocalClient_RequestContext(t *testing.T) {
+	type requestMeta struct {
+		UserID int `json:"user_id"`
+	}
+
+	app := jsonrpc.NewJSONRPCApplication()
+	_ = jsonrpc.AddTypedMethod(app, "whoami", func(ctx context.Context, p struct{}) (int, error) {
+		var meta requestMeta
+		if err := jsonrpc.UnmarshalRequestContext(ctx, &meta); err != nil {
+			return 0, err
+		}
+		return meta.UserID, nil
+	})
+
+	client := jsonrpc.NewLocalClient(app)
+	ctx := context.Background()
+
+	res, err := jsonrpc.Call[struct{}, int](ctx, client, "whoami", struct{}{}, jsonrpc.WithRequestContextValue(requestMeta{UserID: 7}))
+	assert.NoError(t, err)
+	assert.Equal(t, 7, res)
 }
 
 type mockIDGenerator struct {
