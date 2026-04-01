@@ -11,23 +11,22 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/sourcegraph/jsonrpc2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 )
 
 // IDGenerator defines the interface for generating request IDs
 type IDGenerator interface {
-	NextID() jsonrpc2.ID
+	NextID() *ID
 }
 
 type defaultIDGenerator struct {
 	counter int64
 }
 
-func (g *defaultIDGenerator) NextID() jsonrpc2.ID {
+func (g *defaultIDGenerator) NextID() *ID {
 	id := atomic.AddInt64(&g.counter, 1)
-	return jsonrpc2.ID{Num: uint64(id), IsString: false}
+	return &ID{Num: uint64(id), IsString: false}
 }
 
 type Client struct {
@@ -125,7 +124,7 @@ func Call[P any, R any](ctx context.Context, c *Client, method string, params P)
 	}
 	paramsJSON := json.RawMessage(paramsRaw)
 
-	req := &jsonrpc2.Request{
+	req := &Request{
 		Method: method,
 		Params: &paramsJSON,
 		ID:     id,
@@ -136,13 +135,21 @@ func Call[P any, R any](ctx context.Context, c *Client, method string, params P)
 		return result, err
 	}
 
-	var resp jsonrpc2.Response
+	var resp Response
 	if err := json.Unmarshal(respRaw, &resp); err != nil {
 		return result, fmt.Errorf("unmarshal response: %w", err)
 	}
 
-	if resp.ID.String() != id.String() {
-		return result, fmt.Errorf("response ID mismatch: expected %s, got %s", id.String(), resp.ID.String())
+	if resp.ID == nil || id == nil || resp.ID.String() != id.String() {
+		expected := "nil"
+		if id != nil {
+			expected = id.String()
+		}
+		got := "nil"
+		if resp.ID != nil {
+			got = resp.ID.String()
+		}
+		return result, fmt.Errorf("response ID mismatch: expected %s, got %s", expected, got)
 	}
 
 	if resp.Error != nil {
@@ -168,10 +175,9 @@ func Notify[P any](ctx context.Context, c *Client, method string, params P) erro
 	}
 	paramsJSON := json.RawMessage(paramsRaw)
 
-	req := &jsonrpc2.Request{
+	req := &Request{
 		Method: method,
 		Params: &paramsJSON,
-		Notif:  true,
 	}
 
 	_, err = c.sendRequest(ctx, req)
@@ -185,8 +191,8 @@ type Batch struct {
 }
 
 type batchCallEntry struct {
-	request *jsonrpc2.Request
-	handle  func(*jsonrpc2.Response)
+	request *Request
+	handle  func(*Response)
 }
 
 func (c *Client) NewBatch() *Batch {
@@ -221,7 +227,7 @@ func AddBatchCall[P any, R any](b *Batch, method string, params P) (*BatchCall[R
 	paramsJSON := json.RawMessage(paramsRaw)
 	id := b.client.idGenerator.NextID()
 
-	req := &jsonrpc2.Request{
+	req := &Request{
 		Method: method,
 		Params: &paramsJSON,
 		ID:     id,
@@ -233,13 +239,21 @@ func AddBatchCall[P any, R any](b *Batch, method string, params P) (*BatchCall[R
 
 	b.calls = append(b.calls, batchCallEntry{
 		request: req,
-		handle: func(resp *jsonrpc2.Response) {
+		handle: func(resp *Response) {
 			if resp == nil {
 				res.set(res.result, errors.New("no response"))
 				return
 			}
-			if resp.ID.String() != id.String() {
-				res.set(res.result, fmt.Errorf("response ID mismatch: expected %s, got %s", id.String(), resp.ID.String()))
+			if resp.ID == nil || id == nil || resp.ID.String() != id.String() {
+				expected := "nil"
+				if id != nil {
+					expected = id.String()
+				}
+				got := "nil"
+				if resp.ID != nil {
+					got = resp.ID.String()
+				}
+				res.set(res.result, fmt.Errorf("response ID mismatch: expected %s, got %s", expected, got))
 				return
 			}
 			if resp.Error != nil {
@@ -269,10 +283,9 @@ func AddBatchNotification[P any](b *Batch, method string, params P) error {
 	}
 	paramsJSON := json.RawMessage(paramsRaw)
 
-	req := &jsonrpc2.Request{
+	req := &Request{
 		Method: method,
 		Params: &paramsJSON,
-		Notif:  true,
 	}
 
 	b.calls = append(b.calls, batchCallEntry{
@@ -288,7 +301,7 @@ func (b *Batch) Execute(ctx context.Context) error {
 		return nil
 	}
 
-	reqs := make([]*jsonrpc2.Request, len(b.calls))
+	reqs := make([]*Request, len(b.calls))
 	for i, c := range b.calls {
 		reqs[i] = c.request
 	}
@@ -298,8 +311,8 @@ func (b *Batch) Execute(ctx context.Context) error {
 		// If the entire batch fails, set error on all calls
 		for _, c := range b.calls {
 			if c.handle != nil {
-				c.handle(&jsonrpc2.Response{
-					Error: &jsonrpc2.Error{Code: jsonrpc2.CodeInternalError, Message: err.Error()},
+				c.handle(&Response{
+					Error: &Error{Code: CodeInternalError, Message: err.Error()},
 				})
 			}
 		}
@@ -310,23 +323,23 @@ func (b *Batch) Execute(ctx context.Context) error {
 		// All were notifications or empty response
 		for _, c := range b.calls {
 			if c.handle != nil {
-				c.handle(&jsonrpc2.Response{})
+				c.handle(&Response{})
 			}
 		}
 		return nil
 	}
 
-	var responses []jsonrpc2.Response
+	var responses []Response
 	if err := json.Unmarshal(respRaw, &responses); err != nil {
 		// If unmarshal fails, it might be a single response (error) or just invalid
-		var singleResp jsonrpc2.Response
+		var singleResp Response
 		if err2 := json.Unmarshal(respRaw, &singleResp); err2 == nil {
-			responses = []jsonrpc2.Response{singleResp}
+			responses = []Response{singleResp}
 		} else {
 			for _, c := range b.calls {
 				if c.handle != nil {
-					c.handle(&jsonrpc2.Response{
-						Error: &jsonrpc2.Error{Code: jsonrpc2.CodeInternalError, Message: "failed to unmarshal batch response: " + err.Error()},
+					c.handle(&Response{
+						Error: &Error{Code: CodeInternalError, Message: "failed to unmarshal batch response: " + err.Error()},
 					})
 				}
 			}
@@ -334,9 +347,11 @@ func (b *Batch) Execute(ctx context.Context) error {
 		}
 	}
 
-	respMap := make(map[string]*jsonrpc2.Response)
+	respMap := make(map[string]*Response)
 	for i := range responses {
-		respMap[responses[i].ID.String()] = &responses[i]
+		if responses[i].ID != nil {
+			respMap[responses[i].ID.String()] = &responses[i]
+		}
 	}
 
 	for _, c := range b.calls {
