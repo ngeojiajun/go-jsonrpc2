@@ -2,6 +2,7 @@ package jsonrpc_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -59,7 +60,7 @@ func decodeResultFloat64(t *testing.T, p *json.RawMessage) float64 {
 
 func TestAddTypedMethod_Success(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	err := jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	err := jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		return p.A + p.B, nil
 	})
 	assert.NoError(t, err)
@@ -83,7 +84,7 @@ func TestAddTypedMethod_Success(t *testing.T) {
 
 func TestAddTypedMethod_InvalidParams(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		return p.A + p.B, nil
 	})
 
@@ -104,7 +105,7 @@ func TestAddTypedMethod_InvalidParams(t *testing.T) {
 
 func TestAddTypedMethod_CustomValidatorOk(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "div", func(ctx *gin.Context, p DivideParams) (float64, error) {
+	_ = jsonrpc.AddTypedMethod(app, "div", func(ctx context.Context, p DivideParams) (float64, error) {
 		return p.A / p.B, nil
 	})
 
@@ -124,7 +125,7 @@ func TestAddTypedMethod_CustomValidatorOk(t *testing.T) {
 
 func TestAddTypedMethod_CustomValidatorFail(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "div", func(ctx *gin.Context, p DivideParams) (float64, error) {
+	_ = jsonrpc.AddTypedMethod(app, "div", func(ctx context.Context, p DivideParams) (float64, error) {
 		return p.A / p.B, nil
 	})
 
@@ -161,7 +162,7 @@ func TestUnknownMethod(t *testing.T) {
 
 func TestBatchRequests(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		return p.A + p.B, nil
 	})
 
@@ -183,7 +184,7 @@ func TestBatchRequests(t *testing.T) {
 
 func TestNotification_NoResponse(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		return p.A + p.B, nil
 	})
 
@@ -203,7 +204,7 @@ func TestNotification_NoResponse(t *testing.T) {
 func TestRPCPanic(t *testing.T) {
 	// The framework must return proper response even the handler paniced
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		panic("boom")
 	})
 
@@ -225,7 +226,7 @@ func TestRPCPanic(t *testing.T) {
 
 func TestRPCPanicInNotification(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		panic("boom")
 	})
 
@@ -243,7 +244,7 @@ func TestRPCPanicInNotification(t *testing.T) {
 
 func TestRPCUndecoableParams(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx *gin.Context, p SumParams) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
 		return p.A + p.B, nil
 	})
 
@@ -265,7 +266,7 @@ func TestRPCUndecoableParams(t *testing.T) {
 
 func TestRPCUnmarshallableResponse(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "bad", func(ctx *gin.Context, p struct{}) (Unmarshallable, error) {
+	_ = jsonrpc.AddTypedMethod(app, "bad", func(ctx context.Context, p struct{}) (Unmarshallable, error) {
 		return Unmarshallable{}, nil
 	})
 
@@ -288,7 +289,7 @@ func TestRPCUnmarshallableResponse(t *testing.T) {
 
 func TestRPCError(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	_ = jsonrpc.AddTypedMethod(app, "bad", func(ctx *gin.Context, p struct{}) (int, error) {
+	_ = jsonrpc.AddTypedMethod(app, "bad", func(ctx context.Context, p struct{}) (int, error) {
 		return 0, errors.New("something went wrong")
 	})
 
@@ -312,20 +313,78 @@ func TestRPCError(t *testing.T) {
 
 func TestContextExtension(t *testing.T) {
 	app := jsonrpc.NewJSONRPCApplication()
-	var capturedContext json.RawMessage
-	_ = app.AddMethod("test", func(ctx *gin.Context, raw json.RawMessage) (any, error) {
-		// In a real application, we might want to extract __context from the request directly.
-		// However, the current RPCMethod only receives the gin context and params.
-		// To properly test this, we should ensure the Request object correctly unmarshals it.
+	type rpcMeta struct {
+		UserID int `json:"user_id"`
+	}
+
+	var captured rpcMeta
+	_ = jsonrpc.AddTypedMethod(app, "test", func(ctx context.Context, p struct{}) (string, error) {
+		err := jsonrpc.UnmarshalRequestContext(ctx, &captured)
+		assert.NoError(t, err)
+
+		req, ok := jsonrpc.RequestFromContext(ctx)
+		assert.True(t, ok)
+		assert.Equal(t, "test", req.Method)
 		return "ok", nil
 	})
 
-	reqBody := `{"jsonrpc":"2.0","id":1,"method":"test","params":{},"__context":{"user_id":123}}`
-	var req jsonrpc.Request
-	err := json.Unmarshal([]byte(reqBody), &req)
+	reqBody := json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"test","params":{},"__context":{"user_id":123}}`)
+	respRaw, err := app.ServeJSON(context.Background(), reqBody)
 	assert.NoError(t, err)
-	assert.NotNil(t, req.Context)
-	err = json.Unmarshal(*req.Context, &capturedContext)
+	assert.Equal(t, 123, captured.UserID)
+
+	var resp jsonrpc.Response
+	err = json.Unmarshal(respRaw, &resp)
 	assert.NoError(t, err)
-	assert.JSONEq(t, `{"user_id":123}`, string(capturedContext))
+	assert.Nil(t, resp.Error)
+}
+
+func TestServeHTTP_InvalidJSON(t *testing.T) {
+	app := jsonrpc.NewJSONRPCApplication()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/rpc", bytes.NewBufferString(`{"jsonrpc":"2.0"`))
+	app.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp jsonrpc.Response
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+	assert.NotNil(t, resp.Error)
+	assert.EqualValues(t, jsonrpc.CodeParseError, resp.Error.Code)
+}
+
+func TestServeJSON_WhitespaceBatch(t *testing.T) {
+	app := jsonrpc.NewJSONRPCApplication()
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
+		return p.A + p.B, nil
+	})
+
+	respRaw, err := app.ServeJSON(context.Background(), json.RawMessage("\n\t[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sum\",\"params\":{\"a\":2,\"b\":3}}]"))
+	assert.NoError(t, err)
+
+	var resp []jsonrpc.Response
+	err = json.Unmarshal(respRaw, &resp)
+	assert.NoError(t, err)
+	assert.Len(t, resp, 1)
+	assert.EqualValues(t, 5, decodeResult(t, resp[0].Result))
+}
+
+func TestInvoke_LocalCaller(t *testing.T) {
+	app := jsonrpc.NewJSONRPCApplication()
+	_ = jsonrpc.AddTypedMethod(app, "sum", func(ctx context.Context, p SumParams) (int, error) {
+		return p.A + p.B, nil
+	})
+
+	params := json.RawMessage(`{"a":4,"b":7}`)
+	resp := app.Invoke(context.Background(), &jsonrpc.Request{
+		Method: "sum",
+		Params: &params,
+		ID:     &jsonrpc.ID{Num: 1},
+	})
+
+	if assert.NotNil(t, resp) {
+		assert.Nil(t, resp.Error)
+		assert.EqualValues(t, 11, decodeResult(t, resp.Result))
+	}
 }

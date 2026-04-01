@@ -1,8 +1,11 @@
 package jsonrpc
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -20,7 +23,7 @@ import (
 // Provide simple handling for jsonrpc
 
 // Base type for RPC Method
-type RPCMethod = func(context *gin.Context, request json.RawMessage) (any, error)
+type RPCMethod = func(context.Context, json.RawMessage) (any, error)
 
 type JSONRPCApplication struct {
 	methods map[string]RPCMethod
@@ -55,13 +58,24 @@ func WithJSONRPCLogger(logger *slog.Logger) JSONRPCApplicationOptions {
 	}
 }
 
-func raiseJSONRPCError(ctx *gin.Context, req *Request, code int64, msg string, data any) {
+func writeJSONResponse(w http.ResponseWriter, status int, payload any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, err = w.Write(body)
+	return err
+}
+
+func writeJSONRPCError(w http.ResponseWriter, req *Request, code int64, msg string, data any) error {
 	var res Response
 	res.Error = BuildJSONRPCError(code, msg, data)
 	if req != nil {
 		res.ID = req.ID
 	}
-	ctx.AbortWithStatusJSON(http.StatusOK, res)
+	return writeJSONResponse(w, http.StatusOK, res)
 }
 
 // Build a JSONRPC Error that you can return as Error
@@ -84,8 +98,8 @@ func (app *JSONRPCApplication) AddMethod(name string, method RPCMethod) error {
 }
 
 // Add a method into the application so it can serves the request. This variant will enforce type checking
-func AddTypedMethod[T any, R any](app *JSONRPCApplication, name string, fn func(*gin.Context, T) (R, error)) error {
-	f := func(ctx *gin.Context, raw json.RawMessage) (any, error) {
+func AddTypedMethod[T any, R any](app *JSONRPCApplication, name string, fn func(context.Context, T) (R, error)) error {
+	f := func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p T
 		strReader := strReaderPool.Get().(*strings.Reader)
 		defer strReaderPool.Put(strReader)
@@ -106,67 +120,134 @@ func AddTypedMethod[T any, R any](app *JSONRPCApplication, name string, fn func(
 	return app.AddMethod(name, f)
 }
 
-// Handle the request, this is meant to be added directly as gin application
-func (app *JSONRPCApplication) Handle(ctx *gin.Context) {
-	reqCtx, span := app.tracer.Start(ctx.Request.Context(), "JSONRPCApplication.Handle")
-	defer span.End()
-	ctx.Request = ctx.Request.WithContext(reqCtx)
-
+func parseRawPayload(data []byte) (json.RawMessage, error) {
 	var raw json.RawMessage
-	if err := ctx.ShouldBindBodyWithJSON(&raw); err != nil {
-		raiseJSONRPCError(ctx, nil, CodeParseError, "Cannot parse the request", err.Error())
-		return
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func encodePayload(payload any) (json.RawMessage, error) {
+	if payload == nil {
+		return nil, nil
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(body), nil
+}
+
+func (app *JSONRPCApplication) dispatchJSON(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	reqCtx, span := app.tracer.Start(ctx, "JSONRPCApplication.dispatchJSON")
+	defer span.End()
+
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return encodePayload(Response{
+			Error: BuildJSONRPCError(CodeInvalidRequest, "Invalid request", "empty payload"),
+		})
 	}
 
 	// Check if batch or single request
-	if len(raw) > 0 && raw[0] == '[' {
+	if trimmed[0] == '[' {
 		var reqs []Request
 		if err := json.Unmarshal(raw, &reqs); err != nil {
-			raiseJSONRPCError(ctx, nil, CodeInvalidRequest, "Invalid batch request", err.Error())
-			return
+			return encodePayload(Response{
+				Error: BuildJSONRPCError(CodeInvalidRequest, "Invalid batch request", err.Error()),
+			})
 		}
 		var responses []Response
 		for _, r := range reqs {
-			if res := app.handleSingle(ctx, &r); res != nil {
+			if res := app.handleSingle(reqCtx, &r); res != nil {
 				responses = append(responses, *res)
 			}
 		}
 		if len(responses) > 0 {
-			ctx.JSON(http.StatusOK, responses)
-		} else {
-			// all were notifications → return nothing
-			ctx.Status(http.StatusNoContent)
+			return encodePayload(responses)
 		}
+		return nil, nil
 	} else {
 		var req Request
 		if err := json.Unmarshal(raw, &req); err != nil {
-			raiseJSONRPCError(ctx, nil, CodeInvalidRequest, "Invalid request", err.Error())
-			return
+			return encodePayload(Response{
+				Error: BuildJSONRPCError(CodeInvalidRequest, "Invalid request", err.Error()),
+			})
 		}
-		if res := app.handleSingle(ctx, &req); res != nil {
-			ctx.JSON(http.StatusOK, res)
-		} else {
-			// notification → no response
-			ctx.Status(http.StatusNoContent)
+		if res := app.handleSingle(reqCtx, &req); res != nil {
+			return encodePayload(res)
 		}
+		return nil, nil
 	}
 }
 
-func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *Request) (res *Response) {
+// Handle the request, this is meant to be added directly as gin application
+func (app *JSONRPCApplication) Handle(ctx *gin.Context) {
+	app.ServeHTTP(ctx.Writer, ctx.Request)
+}
+
+// ServeHTTP exposes the application as a standard net/http handler.
+func (app *JSONRPCApplication) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	reqCtx, span := app.tracer.Start(r.Context(), "JSONRPCApplication.ServeHTTP")
+	defer span.End()
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		_ = writeJSONRPCError(w, nil, CodeParseError, "Cannot parse the request", err.Error())
+		return
+	}
+
+	raw, err := parseRawPayload(body)
+	if err != nil {
+		_ = writeJSONRPCError(w, nil, CodeParseError, "Cannot parse the request", err.Error())
+		return
+	}
+
+	payload, err := app.dispatchJSON(reqCtx, raw)
+	if err != nil {
+		_ = writeJSONRPCError(w, nil, CodeInternalError, "Error occured while marshalling response", err.Error())
+		return
+	}
+	if payload == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
+}
+
+// ServeJSON handles a raw JSON-RPC payload and returns the encoded response payload.
+// A nil response means the request resolved to notifications only.
+func (app *JSONRPCApplication) ServeJSON(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	validated, err := parseRawPayload(raw)
+	if err != nil {
+		return nil, BuildJSONRPCError(CodeParseError, "Cannot parse the request", err.Error())
+	}
+	return app.dispatchJSON(ctx, validated)
+}
+
+// Invoke handles a single request directly, which is useful for local transports.
+func (app *JSONRPCApplication) Invoke(ctx context.Context, req *Request) *Response {
+	return app.handleSingle(ctx, req)
+}
+
+func (app *JSONRPCApplication) handleSingle(ctx context.Context, req *Request) (res *Response) {
 	// Collecting info
 	rpcStart := time.Now()
 	var reqIDStr string
 	if req.ID != nil {
 		reqIDStr = req.ID.String()
 	}
-	reqCtx, span := app.tracer.Start(ctx.Request.Context(), "JSONRPCApplication.handleSingle",
+	reqCtx := withRequest(ctx, req)
+	reqCtx, span := app.tracer.Start(reqCtx, "JSONRPCApplication.handleSingle",
 		trace.WithAttributes(
 			attribute.String("method", req.Method),
 			attribute.Bool("is_notification", req.Notif),
 			attribute.String("id", reqIDStr),
 		),
 	)
-	ctx.Request = ctx.Request.WithContext(reqCtx)
 	// Setup crash handler here, and also measure the timing
 	defer func() {
 		callInfo := slog.Group("call",
@@ -175,7 +256,7 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *Request) (res
 			slog.Bool("IsNotification", req.Notif),
 		)
 		if err := recover(); err != nil {
-			app.logger.ErrorContext(ctx.Request.Context(),
+			app.logger.ErrorContext(reqCtx,
 				"A fatal error occured while processing RPC call/notification",
 				callInfo,
 				slog.Any("error", err),
@@ -202,7 +283,7 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *Request) (res
 				} else {
 					span.SetStatus(codes.Ok, "Processing succeeded")
 				}
-				slog.Log(ctx.Request.Context(), level,
+				slog.Log(reqCtx, level,
 					"Processed a RPC notification",
 					callInfo,
 					slog.Bool("failed", level == slog.LevelError),
@@ -220,7 +301,7 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *Request) (res
 					span.SetStatus(codes.Ok, "Processing succeeded")
 				}
 				app.logger.InfoContext(
-					ctx.Request.Context(),
+					reqCtx,
 					"Processed a RPC call",
 					callInfo,
 					slog.Bool("failed", failed),
@@ -248,9 +329,9 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *Request) (res
 		raw = *req.Params
 	}
 
-	result, err := method(ctx, raw)
+	result, err := method(reqCtx, raw)
 	if err != nil {
-		app.logger.ErrorContext(ctx.Request.Context(), "Error occured while processing RPC", slog.String("method", req.Method), slog.Any("error", err), slog.Any("timeTaken", time.Since(rpcStart)))
+		app.logger.ErrorContext(reqCtx, "Error occured while processing RPC", slog.String("method", req.Method), slog.Any("error", err), slog.Any("timeTaken", time.Since(rpcStart)))
 		switch e := err.(type) {
 		case *Error:
 			res = &Response{ID: req.ID, Error: e}
@@ -275,7 +356,7 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *Request) (res
 
 	responseRaw, err := json.Marshal(result)
 	if err != nil {
-		app.logger.ErrorContext(ctx.Request.Context(), "RPC succeeded but JSON marshalling failed", slog.String("method", req.Method), slog.Any("error", err))
+		app.logger.ErrorContext(reqCtx, "RPC succeeded but JSON marshalling failed", slog.String("method", req.Method), slog.Any("error", err))
 		res = &Response{
 			ID: req.ID,
 			Error: BuildJSONRPCError(

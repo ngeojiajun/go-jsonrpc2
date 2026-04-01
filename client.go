@@ -15,6 +15,11 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 )
 
+type requestSender interface {
+	sendRequest(ctx context.Context, payload any) (json.RawMessage, error)
+	nextID() *ID
+}
+
 // IDGenerator defines the interface for generating request IDs
 type IDGenerator interface {
 	NextID() *ID
@@ -29,23 +34,25 @@ func (g *defaultIDGenerator) NextID() *ID {
 	return &ID{Num: uint64(id), IsString: false}
 }
 
-type Client struct {
+type HTTPClient struct {
 	url         string
 	httpClient  *http.Client
 	headers     http.Header
 	idGenerator IDGenerator
 }
 
-type ClientOption func(*Client)
+type Client = HTTPClient
+
+type ClientOption func(*HTTPClient)
 
 func WithHTTPClient(httpClient *http.Client) ClientOption {
-	return func(c *Client) {
+	return func(c *HTTPClient) {
 		c.httpClient = httpClient
 	}
 }
 
 func WithHeader(key, value string) ClientOption {
-	return func(c *Client) {
+	return func(c *HTTPClient) {
 		if c.headers == nil {
 			c.headers = make(http.Header)
 		}
@@ -54,13 +61,13 @@ func WithHeader(key, value string) ClientOption {
 }
 
 func WithIDGenerator(gen IDGenerator) ClientOption {
-	return func(c *Client) {
+	return func(c *HTTPClient) {
 		c.idGenerator = gen
 	}
 }
 
-func NewClient(url string, opts ...ClientOption) *Client {
-	c := &Client{
+func NewHTTPClient(url string, opts ...ClientOption) *HTTPClient {
+	c := &HTTPClient{
 		url:         url,
 		httpClient:  http.DefaultClient,
 		headers:     make(http.Header),
@@ -72,7 +79,15 @@ func NewClient(url string, opts ...ClientOption) *Client {
 	return c
 }
 
-func (c *Client) sendRequest(ctx context.Context, payload any) (json.RawMessage, error) {
+func NewClient(url string, opts ...ClientOption) *Client {
+	return NewHTTPClient(url, opts...)
+}
+
+func (c *HTTPClient) nextID() *ID {
+	return c.idGenerator.NextID()
+}
+
+func (c *HTTPClient) sendRequest(ctx context.Context, payload any) (json.RawMessage, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -113,28 +128,92 @@ func (c *Client) sendRequest(ctx context.Context, payload any) (json.RawMessage,
 	return json.RawMessage(respBody), nil
 }
 
-// Call performs a type-safe JSON-RPC call
-func Call[P any, R any](ctx context.Context, c *Client, method string, params P) (R, error) {
-	var result R
-	id := c.idGenerator.NextID()
+type LocalClient struct {
+	app         *JSONRPCApplication
+	idGenerator IDGenerator
+}
 
+type LocalClientOption func(*LocalClient)
+
+func WithLocalIDGenerator(gen IDGenerator) LocalClientOption {
+	return func(c *LocalClient) {
+		c.idGenerator = gen
+	}
+}
+
+func NewLocalClient(app *JSONRPCApplication, opts ...LocalClientOption) *LocalClient {
+	c := &LocalClient{
+		app:         app,
+		idGenerator: &defaultIDGenerator{},
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+func (c *LocalClient) nextID() *ID {
+	return c.idGenerator.NextID()
+}
+
+func (c *LocalClient) sendRequest(ctx context.Context, payload any) (json.RawMessage, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	return c.app.ServeJSON(ctx, json.RawMessage(body))
+}
+
+type RequestOption func(*Request) error
+
+func WithRequestContextValue(value any) RequestOption {
+	return func(req *Request) error {
+		if value == nil {
+			req.Context = nil
+			return nil
+		}
+		body, err := json.Marshal(value)
+		if err != nil {
+			return fmt.Errorf("marshal request context: %w", err)
+		}
+		raw := json.RawMessage(body)
+		req.Context = &raw
+		return nil
+	}
+}
+
+func marshalParams[P any](params P) (*json.RawMessage, error) {
 	paramsRaw, err := json.Marshal(params)
 	if err != nil {
-		return result, fmt.Errorf("marshal params: %w", err)
+		return nil, fmt.Errorf("marshal params: %w", err)
 	}
 	paramsJSON := json.RawMessage(paramsRaw)
+	return &paramsJSON, nil
+}
+
+func buildRequest[P any](id *ID, method string, params P, opts ...RequestOption) (*Request, error) {
+	paramsJSON, err := marshalParams(params)
+	if err != nil {
+		return nil, err
+	}
 
 	req := &Request{
 		Method: method,
-		Params: &paramsJSON,
+		Params: paramsJSON,
 		ID:     id,
 	}
 
-	respRaw, err := c.sendRequest(ctx, req)
-	if err != nil {
-		return result, err
+	for _, opt := range opts {
+		if err := opt(req); err != nil {
+			return nil, err
+		}
 	}
 
+	return req, nil
+}
+
+func decodeCallResult[R any](respRaw json.RawMessage, id *ID) (R, error) {
+	var result R
 	var resp Response
 	if err := json.Unmarshal(respRaw, &resp); err != nil {
 		return result, fmt.Errorf("unmarshal response: %w", err)
@@ -167,17 +246,29 @@ func Call[P any, R any](ctx context.Context, c *Client, method string, params P)
 	return result, nil
 }
 
-// Notify performs a JSON-RPC notification (no response expected)
-func Notify[P any](ctx context.Context, c *Client, method string, params P) error {
-	paramsRaw, err := json.Marshal(params)
-	if err != nil {
-		return fmt.Errorf("marshal params: %w", err)
-	}
-	paramsJSON := json.RawMessage(paramsRaw)
+// Call performs a type-safe JSON-RPC call
+func Call[P any, R any](ctx context.Context, c requestSender, method string, params P, opts ...RequestOption) (R, error) {
+	var result R
+	id := c.nextID()
 
-	req := &Request{
-		Method: method,
-		Params: &paramsJSON,
+	req, err := buildRequest(id, method, params, opts...)
+	if err != nil {
+		return result, err
+	}
+
+	respRaw, err := c.sendRequest(ctx, req)
+	if err != nil {
+		return result, err
+	}
+
+	return decodeCallResult[R](respRaw, id)
+}
+
+// Notify performs a JSON-RPC notification (no response expected)
+func Notify[P any](ctx context.Context, c requestSender, method string, params P, opts ...RequestOption) error {
+	req, err := buildRequest((*ID)(nil), method, params, opts...)
+	if err != nil {
+		return err
 	}
 
 	_, err = c.sendRequest(ctx, req)
@@ -186,7 +277,7 @@ func Notify[P any](ctx context.Context, c *Client, method string, params P) erro
 
 // Batch represents a builder for JSON-RPC batch requests
 type Batch struct {
-	client *Client
+	client requestSender
 	calls  []batchCallEntry
 }
 
@@ -195,7 +286,11 @@ type batchCallEntry struct {
 	handle  func(*Response)
 }
 
-func (c *Client) NewBatch() *Batch {
+func (c *HTTPClient) NewBatch() *Batch {
+	return &Batch{client: c}
+}
+
+func (c *LocalClient) NewBatch() *Batch {
 	return &Batch{client: c}
 }
 
@@ -219,18 +314,12 @@ func (bc *BatchCall[R]) set(result R, err error) {
 	})
 }
 
-func AddBatchCall[P any, R any](b *Batch, method string, params P) (*BatchCall[R], error) {
-	paramsRaw, err := json.Marshal(params)
-	if err != nil {
-		return nil, fmt.Errorf("marshal params: %w", err)
-	}
-	paramsJSON := json.RawMessage(paramsRaw)
-	id := b.client.idGenerator.NextID()
+func AddBatchCall[P any, R any](b *Batch, method string, params P, opts ...RequestOption) (*BatchCall[R], error) {
+	id := b.client.nextID()
 
-	req := &Request{
-		Method: method,
-		Params: &paramsJSON,
-		ID:     id,
+	req, err := buildRequest(id, method, params, opts...)
+	if err != nil {
+		return nil, err
 	}
 
 	res := &BatchCall[R]{
@@ -276,16 +365,10 @@ func AddBatchCall[P any, R any](b *Batch, method string, params P) (*BatchCall[R
 	return res, nil
 }
 
-func AddBatchNotification[P any](b *Batch, method string, params P) error {
-	paramsRaw, err := json.Marshal(params)
+func AddBatchNotification[P any](b *Batch, method string, params P, opts ...RequestOption) error {
+	req, err := buildRequest((*ID)(nil), method, params, opts...)
 	if err != nil {
-		return fmt.Errorf("marshal params: %w", err)
-	}
-	paramsJSON := json.RawMessage(paramsRaw)
-
-	req := &Request{
-		Method: method,
-		Params: &paramsJSON,
+		return err
 	}
 
 	b.calls = append(b.calls, batchCallEntry{
