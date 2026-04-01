@@ -10,7 +10,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	jsonrpc "github.com/ngeojiajun/go-jsonrpc2"
-	"github.com/sourcegraph/jsonrpc2"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -75,7 +74,7 @@ func TestAddTypedMethod_Success(t *testing.T) {
 
 	assert.Equal(t, 200, w.Code)
 
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	err = json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.NoError(t, err)
 	assert.Nil(t, resp.Error)
@@ -97,10 +96,10 @@ func TestAddTypedMethod_InvalidParams(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.NotNil(t, resp.Error)
-	assert.EqualValues(t, jsonrpc2.CodeInvalidParams, resp.Error.Code)
+	assert.EqualValues(t, jsonrpc.CodeInvalidParams, resp.Error.Code)
 }
 
 func TestAddTypedMethod_CustomValidatorOk(t *testing.T) {
@@ -117,7 +116,7 @@ func TestAddTypedMethod_CustomValidatorOk(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Nil(t, resp.Error)
 	assert.EqualValues(t, float64(1.25), decodeResultFloat64(t, resp.Result))
@@ -137,10 +136,10 @@ func TestAddTypedMethod_CustomValidatorFail(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.NotNil(t, resp.Error)
-	assert.EqualValues(t, jsonrpc2.CodeInvalidParams, resp.Error.Code)
+	assert.EqualValues(t, jsonrpc.CodeInvalidParams, resp.Error.Code)
 	assert.EqualValues(t, "B must not be zero", resp.Error.Message)
 }
 
@@ -154,10 +153,10 @@ func TestUnknownMethod(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.NotNil(t, resp.Error)
-	assert.EqualValues(t, jsonrpc2.CodeMethodNotFound, resp.Error.Code)
+	assert.EqualValues(t, jsonrpc.CodeMethodNotFound, resp.Error.Code)
 }
 
 func TestBatchRequests(t *testing.T) {
@@ -175,7 +174,7 @@ func TestBatchRequests(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
-	var resp []jsonrpc2.Response
+	var resp []jsonrpc.Response
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Len(t, resp, 2)
 	assert.EqualValues(t, float64(3), decodeResult(t, resp[0].Result))
@@ -217,11 +216,11 @@ func TestRPCPanic(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	err := json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp.Error)
-	assert.EqualValues(t, jsonrpc2.CodeInternalError, resp.Error.Code)
+	assert.EqualValues(t, jsonrpc.CodeInternalError, resp.Error.Code)
 }
 
 func TestRPCPanicInNotification(t *testing.T) {
@@ -257,11 +256,11 @@ func TestRPCUndecoableParams(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	err := json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp.Error)
-	assert.EqualValues(t, jsonrpc2.CodeInvalidParams, resp.Error.Code)
+	assert.EqualValues(t, jsonrpc.CodeInvalidParams, resp.Error.Code)
 }
 
 func TestRPCUnmarshallableResponse(t *testing.T) {
@@ -279,11 +278,11 @@ func TestRPCUnmarshallableResponse(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	err := json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp.Error)
-	assert.EqualValues(t, jsonrpc2.CodeInternalError, resp.Error.Code)
+	assert.EqualValues(t, jsonrpc.CodeInternalError, resp.Error.Code)
 	assert.Contains(t, resp.Error.Message, "Error occured while marshalling response")
 }
 
@@ -302,11 +301,31 @@ func TestRPCError(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	var resp jsonrpc2.Response
+	var resp jsonrpc.Response
 	err := json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp.Error)
-	assert.EqualValues(t, jsonrpc2.CodeInternalError, resp.Error.Code)
+	assert.EqualValues(t, jsonrpc.CodeInternalError, resp.Error.Code)
 	// The error message should be generic, not exposing internal error details
 	assert.EqualValues(t, "Error occured while processing request", resp.Error.Message)
+}
+
+func TestContextExtension(t *testing.T) {
+	app := jsonrpc.NewJSONRPCApplication()
+	var capturedContext json.RawMessage
+	_ = app.AddMethod("test", func(ctx *gin.Context, raw json.RawMessage) (any, error) {
+		// In a real application, we might want to extract __context from the request directly.
+		// However, the current RPCMethod only receives the gin context and params.
+		// To properly test this, we should ensure the Request object correctly unmarshals it.
+		return "ok", nil
+	})
+
+	reqBody := `{"jsonrpc":"2.0","id":1,"method":"test","params":{},"__context":{"user_id":123}}`
+	var req jsonrpc.Request
+	err := json.Unmarshal([]byte(reqBody), &req)
+	assert.NoError(t, err)
+	assert.NotNil(t, req.Context)
+	err = json.Unmarshal(*req.Context, &capturedContext)
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"user_id":123}`, string(capturedContext))
 }

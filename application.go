@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/sourcegraph/jsonrpc2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -56,8 +55,8 @@ func WithJSONRPCLogger(logger *slog.Logger) JSONRPCApplicationOptions {
 	}
 }
 
-func raiseJSONRPCError(ctx *gin.Context, req *jsonrpc2.Request, code int64, msg string, data any) {
-	var res jsonrpc2.Response
+func raiseJSONRPCError(ctx *gin.Context, req *Request, code int64, msg string, data any) {
+	var res Response
 	res.Error = BuildJSONRPCError(code, msg, data)
 	if req != nil {
 		res.ID = req.ID
@@ -65,14 +64,14 @@ func raiseJSONRPCError(ctx *gin.Context, req *jsonrpc2.Request, code int64, msg 
 	ctx.AbortWithStatusJSON(http.StatusOK, res)
 }
 
-// Build a jsonrpc2.Error that you can return as Error
-func BuildJSONRPCError(code int64, msg string, data any) *jsonrpc2.Error {
-	var error = &jsonrpc2.Error{
+// Build a JSONRPC Error that you can return as Error
+func BuildJSONRPCError(code int64, msg string, data any) *Error {
+	var err = &Error{
 		Code:    code,
 		Message: msg,
 	}
-	error.SetError(data)
-	return error
+	err.SetError(data)
+	return err
 }
 
 // Add a method into the application so it can serves the request
@@ -94,12 +93,12 @@ func AddTypedMethod[T any, R any](app *JSONRPCApplication, name string, fn func(
 		reader := json.NewDecoder(strReader)
 		reader.DisallowUnknownFields()
 		if err := reader.Decode(&p); err != nil {
-			return nil, &jsonrpc2.Error{Code: jsonrpc2.CodeInvalidParams, Message: err.Error()}
+			return nil, &Error{Code: CodeInvalidParams, Message: err.Error()}
 		}
 		// Extension: If the object implement custom validation
 		if p, ok := any(p).(Validator); ok {
 			if err := p.Validate(); err != nil {
-				return nil, &jsonrpc2.Error{Code: jsonrpc2.CodeInvalidParams, Message: err.Error()}
+				return nil, &Error{Code: CodeInvalidParams, Message: err.Error()}
 			}
 		}
 		return fn(ctx, p)
@@ -115,18 +114,18 @@ func (app *JSONRPCApplication) Handle(ctx *gin.Context) {
 
 	var raw json.RawMessage
 	if err := ctx.ShouldBindBodyWithJSON(&raw); err != nil {
-		raiseJSONRPCError(ctx, nil, jsonrpc2.CodeParseError, "Cannot parse the request", err.Error())
+		raiseJSONRPCError(ctx, nil, CodeParseError, "Cannot parse the request", err.Error())
 		return
 	}
 
 	// Check if batch or single request
 	if len(raw) > 0 && raw[0] == '[' {
-		var reqs []jsonrpc2.Request
+		var reqs []Request
 		if err := json.Unmarshal(raw, &reqs); err != nil {
-			raiseJSONRPCError(ctx, nil, jsonrpc2.CodeInvalidRequest, "Invalid batch request", err.Error())
+			raiseJSONRPCError(ctx, nil, CodeInvalidRequest, "Invalid batch request", err.Error())
 			return
 		}
-		var responses []jsonrpc2.Response
+		var responses []Response
 		for _, r := range reqs {
 			if res := app.handleSingle(ctx, &r); res != nil {
 				responses = append(responses, *res)
@@ -139,9 +138,9 @@ func (app *JSONRPCApplication) Handle(ctx *gin.Context) {
 			ctx.Status(http.StatusNoContent)
 		}
 	} else {
-		var req jsonrpc2.Request
+		var req Request
 		if err := json.Unmarshal(raw, &req); err != nil {
-			raiseJSONRPCError(ctx, nil, jsonrpc2.CodeInvalidRequest, "Invalid request", err.Error())
+			raiseJSONRPCError(ctx, nil, CodeInvalidRequest, "Invalid request", err.Error())
 			return
 		}
 		if res := app.handleSingle(ctx, &req); res != nil {
@@ -153,21 +152,25 @@ func (app *JSONRPCApplication) Handle(ctx *gin.Context) {
 	}
 }
 
-func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *jsonrpc2.Request) (res *jsonrpc2.Response) {
+func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *Request) (res *Response) {
 	// Collecting info
 	rpcStart := time.Now()
+	var reqIDStr string
+	if req.ID != nil {
+		reqIDStr = req.ID.String()
+	}
 	reqCtx, span := app.tracer.Start(ctx.Request.Context(), "JSONRPCApplication.handleSingle",
 		trace.WithAttributes(
 			attribute.String("method", req.Method),
 			attribute.Bool("is_notification", req.Notif),
-			attribute.String("id", req.ID.String()),
+			attribute.String("id", reqIDStr),
 		),
 	)
 	ctx.Request = ctx.Request.WithContext(reqCtx)
 	// Setup crash handler here, and also measure the timing
 	defer func() {
 		callInfo := slog.Group("call",
-			slog.String("id", req.ID.String()),
+			slog.String("id", reqIDStr),
 			slog.String("method", req.Method),
 			slog.Bool("IsNotification", req.Notif),
 		)
@@ -180,9 +183,9 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *jsonrpc2.Requ
 			if req.Notif {
 				res = nil
 			} else {
-				res = &jsonrpc2.Response{
+				res = &Response{
 					ID:    req.ID,
-					Error: BuildJSONRPCError(jsonrpc2.CodeInternalError, "Internal error occured", nil),
+					Error: BuildJSONRPCError(CodeInternalError, "Internal error occured", nil),
 				}
 			}
 			span.SetStatus(codes.Error, "Handler paniced")
@@ -230,10 +233,10 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *jsonrpc2.Requ
 
 	method, ok := app.methods[req.Method]
 	if !ok {
-		res = &jsonrpc2.Response{
+		res = &Response{
 			ID: req.ID,
-			Error: &jsonrpc2.Error{
-				Code:    jsonrpc2.CodeMethodNotFound,
+			Error: &Error{
+				Code:    CodeMethodNotFound,
 				Message: fmt.Sprintf("Method %s not found", req.Method),
 			},
 		}
@@ -249,14 +252,14 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *jsonrpc2.Requ
 	if err != nil {
 		app.logger.ErrorContext(ctx.Request.Context(), "Error occured while processing RPC", slog.String("method", req.Method), slog.Any("error", err), slog.Any("timeTaken", time.Since(rpcStart)))
 		switch e := err.(type) {
-		case *jsonrpc2.Error:
-			res = &jsonrpc2.Response{ID: req.ID, Error: e}
+		case *Error:
+			res = &Response{ID: req.ID, Error: e}
 			return
 		default:
-			res = &jsonrpc2.Response{
+			res = &Response{
 				ID: req.ID,
 				Error: BuildJSONRPCError(
-					jsonrpc2.CodeInternalError,
+					CodeInternalError,
 					"Error occured while processing request",
 					err.Error(),
 				),
@@ -273,10 +276,10 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *jsonrpc2.Requ
 	responseRaw, err := json.Marshal(result)
 	if err != nil {
 		app.logger.ErrorContext(ctx.Request.Context(), "RPC succeeded but JSON marshalling failed", slog.String("method", req.Method), slog.Any("error", err))
-		res = &jsonrpc2.Response{
+		res = &Response{
 			ID: req.ID,
 			Error: BuildJSONRPCError(
-				jsonrpc2.CodeInternalError,
+				CodeInternalError,
 				"Error occured while marshalling response",
 				err.Error(),
 			),
@@ -286,7 +289,7 @@ func (app *JSONRPCApplication) handleSingle(ctx *gin.Context, req *jsonrpc2.Requ
 
 	responseJSON := json.RawMessage(responseRaw)
 
-	res = &jsonrpc2.Response{
+	res = &Response{
 		ID:     req.ID,
 		Result: &responseJSON,
 	}

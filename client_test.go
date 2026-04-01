@@ -14,7 +14,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	jsonrpc "github.com/ngeojiajun/go-jsonrpc2"
-	"github.com/sourcegraph/jsonrpc2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -117,9 +116,9 @@ func TestClient_Error(t *testing.T) {
 	_, err := jsonrpc.Call[struct{}, int](ctx, client, "fail", struct{}{})
 	assert.Error(t, err)
 
-	var rpcErr *jsonrpc2.Error
+	var rpcErr *jsonrpc.Error
 	assert.True(t, errors.As(err, &rpcErr))
-	assert.Equal(t, int64(jsonrpc2.CodeInternalError), rpcErr.Code)
+	assert.Equal(t, jsonrpc.CodeInternalError, rpcErr.Code)
 }
 
 func TestClient_Options(t *testing.T) {
@@ -143,20 +142,20 @@ type mockIDGenerator struct {
 	id string
 }
 
-func (m *mockIDGenerator) NextID() jsonrpc2.ID {
-	return jsonrpc2.ID{Str: m.id, IsString: true}
+func (m *mockIDGenerator) NextID() *jsonrpc.ID {
+	return &jsonrpc.ID{Str: m.id, IsString: true}
 }
 
 func TestClient_CustomIDGenerator(t *testing.T) {
 	var capturedID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req jsonrpc2.Request
+		var req jsonrpc.Request
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &req)
 		capturedID = req.ID.String()
 
 		result := json.RawMessage("null")
-		resp, _ := json.Marshal(jsonrpc2.Response{ID: req.ID, Result: &result})
+		resp, _ := json.Marshal(jsonrpc.Response{ID: req.ID, Result: &result})
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(resp)
 	}))
@@ -167,7 +166,7 @@ func TestClient_CustomIDGenerator(t *testing.T) {
 
 	_, err := jsonrpc.Call[struct{}, any](ctx, client, "any", struct{}{})
 	assert.NoError(t, err)
-	assert.Equal(t, "\"custom-id\"", capturedID)
+	assert.Equal(t, "custom-id", capturedID)
 }
 
 func TestClient_OTelPropagation(t *testing.T) {
@@ -183,7 +182,7 @@ func TestClient_OTelPropagation(t *testing.T) {
 			return
 		}
 		result := json.RawMessage("null")
-		resp, _ := json.Marshal(jsonrpc2.Response{ID: jsonrpc2.ID{Num: 1, IsString: false}, Result: &result})
+		resp, _ := json.Marshal(jsonrpc.Response{ID: &jsonrpc.ID{Num: 1, IsString: false}, Result: &result})
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(resp)
 	}))
